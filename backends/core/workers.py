@@ -22,6 +22,7 @@ from functools import wraps
 import json
 import os
 from random import random
+import re
 import time
 import urllib
 import uuid
@@ -30,9 +31,11 @@ from apiclient.discovery import build
 from apiclient.errors import HttpError
 from apiclient.http import MediaIoBaseUpload
 import cloudstorage as gcs
-from oauth2client.service_account import ServiceAccountCredentials
 from google.cloud import bigquery
+from google.cloud import storage
 from google.cloud.exceptions import ClientError
+from oauth2client.service_account import ServiceAccountCredentials
+import pandas as pd
 import requests
 
 
@@ -906,3 +909,112 @@ class BQToMeasurementProtocolProcessor(BQWorker, MeasurementProtocolWorker):
         page_token=page_token)
     query_first_page = next(query_iterator.pages)
     self._process_query_results(query_first_page, query_iterator.schema)
+
+
+class MLFeatureProcessor(BQWorker):
+  """Worker to one-hot encode categorical features and scale other features.
+
+  NB: Assuming that all string columns of the input tables are categorical
+      features to encode.
+  """
+
+  PARAMS = [
+      ('bq_project_id', 'string', False, '', 'BQ Project ID'),
+      ('bq_dataset_id', 'string', True, '', 'BQ Dataset ID'),
+      ('bq_input_table_id', 'string', True, '', 'BQ Table ID'),
+      ('bq_output_table_id', 'string', True, '', 'BQ Table ID'),
+      ('primary_key_field_name', 'string', True, '',
+          'Field name for the primary key'),
+      ('all_features_path', 'string', True, '',
+          'Path to the complete list of features on GCS'),
+  ]
+
+  # BigQuery batch size for querying results. Default to 10,000.
+  BQ_BATCH_SIZE = int(1e4)
+
+  def _split_bucket_name_and_path(self, gcs_path):
+    matches = re.search(r'gs://([^/]+)/(.*)', gcs_path)
+    if matches is None:
+      raise ValueError('Failed due to wrong format for the GCS path.')
+    first_match = matches.group()
+    if not first_match:
+      raise ValueError('No matched bucket name in the GCS path.')
+    return first_match[0], first_match[1]
+
+  def _storage_setup(self):
+    self._storage_client = storage.Client.from_service_account_json(_KEY_FILE)
+    bucket_name, _ = self._split_bucket_name_and_path(
+        self._params['all_features_path'])
+    self._storage_bucket = self._storage_client.get_bucket(bucket_name)
+
+  def _load_gcs_file(self, gcs_path, output_filename):
+    _, filename = self._split_bucket_name_and_path(
+        self._params['all_features_path'])
+    blob = self._storage_bucket.blob(filename)
+    blob.download_to_filename(output_filename)
+
+  def _load_scaler(self, gcs_path):
+    self._load_gcs_file(gcs_path, './outputs/scaler')
+
+  def _load_all_features(self, gcs_path):
+    self._load_gcs_file(gcs_path, './outputs/all_features')
+
+  def _preprocess_dataframe(self, df, scaler, all_features):
+    # Removes the primary from the features that will be scaled/encoded.
+    features_df = df.drop([self._params['primary_key_field_name']], axis=1)
+    features_df = pd.concat(
+        [
+            features_df.select_dtypes(exclude=['object']),
+            pd.get_dummies(
+                features_df.select_dtypes(include=['object'])
+            ),
+        ],
+        axis=1
+    )
+
+    # Adds missing features.
+    feature_column_names = list(features_df[:])
+    missing_features = set(all_features) - set(feature_column_names)
+    for missing_feature_name in missing_features:
+      features_df[missing_feature_name] = 0
+
+    # Removes extra features.
+    features_df = features_df.loc[:, all_features]
+
+    # Scales non-categorical features.
+    features_df = scaler.transform(features_df).astype('float32')
+    return features_df
+
+  def _execute(self):
+    self._storage_setup()
+    self._bq_setup()
+    self._table.reload()
+    query_iterator = self.retry(self._table.fetch_data, max_retries=1)(
+        max_results=self.BQ_BATCH_SIZE,
+        page_token=page_token)
+    column_headers = [field.name for field in query_iterator.schema]
+    for query_page in query_iterator.pages:
+      raw_df = pd.DataFrame(query_page, columns=column_headers)
+      processed_df = self._preprocess_dataframe(raw_df)
+      #TODO(dulacp) push back into BQ
+
+
+class MLKerasModelRunner(BQWorker):
+  """Worker to run a Keras model"""
+
+  PARAMS = [
+      ('bq_project_id', 'string', False, '', 'BQ Project ID'),
+      ('bq_dataset_id', 'string', True, '', 'BQ Dataset ID'),
+      ('bq_table_id', 'string', True, '', 'BQ Table ID'),
+      ('all_features_path', 'string', True, '',
+          'Path to the complete list of features on GCS'),
+  ]
+
+  # BigQuery batch size for querying results. Default to 10,000.
+  BQ_BATCH_SIZE = int(1e4)
+
+  def _load_model(self, gcs_path):
+    pass
+
+  def _execute(self):
+    pass
