@@ -13,7 +13,7 @@
 // limitations under the License.
 
 import { Injectable } from '@angular/core';
-import { Http, Headers, RequestOptions, URLSearchParams } from '@angular/http';
+import { Headers, RequestOptions, URLSearchParams } from '@angular/http';
 import { serialize } from 'class-transformer';
 import 'rxjs/add/operator/toPromise';
 

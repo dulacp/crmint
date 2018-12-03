@@ -13,7 +13,7 @@
 // limitations under the License.
 
 import { Injectable } from '@angular/core';
-import { Http, Headers, RequestOptions } from '@angular/http';
+import { Headers, RequestOptions } from '@angular/http';
 
 import { ApiService } from 'app/api.service';
 import { Config, Setting } from 'app/config';
